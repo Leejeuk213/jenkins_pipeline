@@ -1,0 +1,824 @@
+/*
+ * ============================================================================
+ *  paas_gitops_dind — Jenkins CI/CD Pipeline (Scripted)
+ * ============================================================================
+ *  사용 오픈소스 (Open Source Components)
+ *  ----------------------------------------------------------------------------
+ *  구분          | 오픈소스                     | 버전                      | 라이선스
+ *  ------------- | ---------------------------- | ------------------------- | ----------------
+ *  CI Server     | Jenkins (inbound-agent)      | 3345.v03dee9b_f88fc-1-jdk21 | MIT
+ *  CI Plugin     | Jenkins Kubernetes Plugin    | -                         | Apache-2.0
+ *  CI Plugin     | SonarQube Scanner for Jenkins| -                         | LGPL-3.0
+ *  SCM           | GitLab                       | -                         | MIT (CE)
+ *  Build         | Apache Maven                 | 3.9.5                     | Apache-2.0
+ *  Runtime       | Eclipse Temurin (OpenJDK)    | 17 (JDK/JRE)              | GPL-2.0 w/ CPE
+ *  Image Build   | Docker Engine (DinD, Moby)   | 20.10                     | Apache-2.0
+ *  Registry      | Harbor                       | -                         | Apache-2.0
+ *  Code Quality  | SonarQube / sonar-scanner-cli| 5.0.1 (scanner)           | LGPL-3.0
+ *  Image Scan    | Trivy                        | 0.60.0                    | Apache-2.0
+ *  Manifest      | Kustomize                    | 5.0.1                     | Apache-2.0
+ *  Manifest Scan | Polaris (Fairwinds)          | 9.6                       | Apache-2.0
+ *  CD            | Argo CD (CLI)                | 3.1.8                     | Apache-2.0
+ *  Secret / PKI  | HashiCorp Vault (CA 발급)    | -                         | BUSL-1.1
+ *  Base Image    | Alpine Linux (argocli-custom)| 3.20                      | MIT 외
+ *  Util          | curl / jq / git              | -                         | curl / MIT / GPL-2.0
+ *  Orchestration | Kubernetes                   | -                         | Apache-2.0
+ * ============================================================================
+ */
+
+// ============================================================================
+//  공통 엔드포인트 (URL 표준화)
+//  - *_HOST : 스킴 없는 호스트명 (git clone 자격증명 삽입, docker login, argocd --server 등에 사용)
+//  - *_URL  : 스킴 포함 전체 URL
+//  환경이 바뀌면 이 블록만 수정한다.
+// ============================================================================
+def DOMAIN         = 'example.com'
+
+def GITLAB_HOST    = "gitlab-y.${DOMAIN}"
+def GITLAB_URL     = "https://${GITLAB_HOST}"
+def GITLAB_API_URL = "${GITLAB_URL}/api/v4"
+
+def HARBOR_HOST    = "harbor-y.${DOMAIN}"
+def HARBOR_URL     = "https://${HARBOR_HOST}"
+def HARBOR_LIBRARY = "${HARBOR_HOST}/library"          // 빌드 도구/베이스 이미지 프로젝트
+
+def ARGOCD_HOST    = "argocd-y.${DOMAIN}"
+def ARGOCD_URL     = "https://${ARGOCD_HOST}"
+
+def SONARQUBE_URL  = 'http://sonarqube-sonarqube.devopsit.svc.cluster.local:9000'   // 클러스터 내부 서비스
+def K8S_API_URL    = 'https://k8s-api.example.com:6443'                                     // Argo CD 배포 대상 클러스터
+
+podTemplate(
+    label: 'jenkinsBuildPipline',
+
+    yamlMergeStrategy: merge() ,
+    yaml: """
+apiVersion: v1
+kind: Pod
+spec:
+  volumes:
+    - name: vault-ca-secret
+      secret:
+        secretName: vault-ca-cert
+    - name: truststore-vol
+      emptyDir: {}
+  initContainers:
+    - name: build-truststore
+      image: ${HARBOR_LIBRARY}/devops-util/jenkins-inbound-agent:3345.v03dee9b_f88fc-1-jdk21
+      # 위 jnlp 컨테이너와 같은 이미지 사용 (JAVA_HOME/keytool 존재 가정).
+      command: ["sh", "-c"]
+      args:
+        - |
+          cp "\$JAVA_HOME/lib/security/cacerts" /truststore/cacerts
+          keytool -importcert -noprompt -trustcacerts \
+            -alias vault-ca \
+            -file /vault-ca/ca.crt \
+            -keystore /truststore/cacerts \
+            -storepass changeit
+      volumeMounts:
+        - name: vault-ca-secret
+          mountPath: /vault-ca
+        - name: truststore-vol
+          mountPath: /truststore
+  containers:
+    - name: jnlp
+      volumeMounts:
+        - name: vault-ca-secret
+          mountPath: /etc/ssl/certs/vault-ca
+        - name: truststore-vol
+          mountPath: /truststore
+    - name: dind
+      # 데몬(dind)/클라이언트(docker)를 분리했으므로 실제로 레지스트리와 TLS 핸드셰이크를 하는 dind(데몬) 쪽에 certs.d를 마운트 한다.
+      volumeMounts:
+        - name: vault-ca-secret
+          mountPath: /etc/docker/certs.d/${HARBOR_HOST}
+    - name: sonarqube
+      volumeMounts:
+        - name: truststore-vol
+          mountPath: /truststore
+    - name: argocli
+      volumeMounts:
+        - name: vault-ca-secret
+          mountPath: /vault-ca
+""",
+    containers: [
+        containerTemplate(
+            name: 'jnlp',
+            image: "${HARBOR_LIBRARY}/devops-util/jenkins-inbound-agent:3345.v03dee9b_f88fc-1-jdk21",
+            // args: '-webSocket',
+            workingDir: '/var/jenkins_home',
+            envVars: [
+                envVar(key: 'TZ', value: 'Asia/Seoul'),
+                envVar(key: 'GIT_SSL_CAINFO', value: '/etc/ssl/certs/vault-ca/ca.crt'),
+                envVar(key: 'CURL_CA_BUNDLE', value: '/etc/ssl/certs/vault-ca/ca.crt')
+                //envVar(key: 'JAVA_TOOL_OPTIONS', value: '-Djavax.net.ssl.trustStore=/truststore/cacerts -Djavax.net.ssl.trustStorePassword=changeit')
+            ]
+        ),
+        // kaniko 컨테이너 제거, DinD(docker-in-docker) 사이드카 2개로 대체
+        // 1) dind: 실제 docker 데몬을 구동하는 루트 권한을 가진(privileged) 사이드카. 파이프라인 코드가 직접 exec 하지 않으면서 보안을 강화함.
+        containerTemplate(
+            name: 'dind',
+            image: "${HARBOR_LIBRARY}/devops-util/docker:20.10-dind",
+            ttyEnabled: true,
+            privileged: true,
+            command: 'dockerd-entrypoint.sh',
+
+            // (내부 사설망 대역과 겹치지 않는 별도 브릿지 대역을 dind에 부여하기 위해 옵션을 추가함.)
+            args: '--host=tcp://0.0.0.0:2375 --host=unix:///var/run/docker.sock --mtu=1450 --tls=false --bip=192.168.250.1/24 --default-address-pool base=192.168.240.0/20,size=24',
+            envVars: [
+                envVar(key: 'DOCKER_TLS_CERTDIR', value: '')
+            ]
+        ),
+        // 2) docker: docker CLI로 build/push/save를 실행하는 클라이언트 컨테이너.
+        //    같은 Pod 안에서는 네트워크 네임스페이스를 공유하므로 localhost:2375로 dind 데몬에 접속한다.
+        containerTemplate(
+            name: 'docker',
+            image: "${HARBOR_LIBRARY}/devops-util/docker:20.10-dind",
+            ttyEnabled: true,
+            command: 'cat',
+            envVars: [
+                envVar(key: 'DOCKER_HOST', value: 'tcp://localhost:2375'),
+                envVar(key: 'DOCKER_TLS_CERTDIR', value: '')
+            ],
+            volumeMounts: [
+                [mountPath: '/built-images', name: 'built-images'],   // trivy와 공유하는 tar 저장 위치
+                [mountPath: '/shared/maven-repo', name: 'shared-repo']
+            ]
+        ),
+        containerTemplate(
+            name: 'sonarqube',
+            image: "${HARBOR_LIBRARY}/sonarsource/sonar-scanner-cli:5.0.1",  // 현재 배포된 Sonarqube-server 버전과 호환되는 버전
+            ttyEnabled: true,
+            command: 'sleep',
+            args: 'infinity',
+            envVars: [
+                envVar(key: 'SONAR_SCANNER_OPTS', value: '-Djavax.net.ssl.trustStore=/truststore/cacerts -Djavax.net.ssl.trustStorePassword=changeit')
+            ]
+        ),
+        containerTemplate(
+            name: 'argocli',
+            image: "${HARBOR_LIBRARY}/argocli-custom:v4",  // custom image alpine:3.20에 argocd(cli version v3.1.8), curl, jq, git 추가
+            ttyEnabled: true,
+            command: 'sleep',
+            args: 'infinity',
+            envVars: [
+                envVar(key: 'CURL_CA_BUNDLE', value: '/vault-ca/ca.crt'),
+                envVar(key: 'GIT_SSL_CAINFO',  value: '/vault-ca/ca.crt'),
+                envVar(key: 'SSL_CERT_FILE',   value: '/vault-ca/ca.crt')
+            ]
+        ),
+        containerTemplate(
+            name: 'trivy',
+            image: "${HARBOR_LIBRARY}/aquasec/trivy:0.60.0",
+            ttyEnabled: true,
+            command: 'sleep',
+            args: 'infinity',
+            volumeMounts: [
+                [mountPath: 'shared/trivy', name: 'shared-cache'],
+                [mountPath: '/built-images', name: 'built-images']   // dind가 만든 tar파일 읽을 위치
+            ]
+        ),
+        containerTemplate(
+            name: 'kustomize',
+            image: "${HARBOR_LIBRARY}/kustomize/kustomize:v5.0.1",
+            ttyEnabled: true,
+            command: 'sleep',
+            args: 'infinity'
+        ),
+        containerTemplate(
+            name: 'polaris',
+            image: "${HARBOR_LIBRARY}/fairwinds/polaris:9.6",
+            ttyEnabled: true,
+            command: 'sleep',
+            args: 'infinity',
+            runAsUser: '0', // Polaris Container Root 권한 필요
+            runAsGroup: '0' // Polaris Container Root 권한 필요
+        ),
+        containerTemplate(
+            name: 'maven',
+            image: "${HARBOR_LIBRARY}/maven:3.9.5-eclipse-temurin-17",
+            ttyEnabled: true,
+            command: 'sleep',
+            args: 'infinity',
+            volumeMounts: [
+                [mountPath: '/shared/maven-repo', name: 'shared-repo']
+            ]
+        )
+    ],
+    volumes: [
+        //   -> 레지스트리 인증은 'Build & Push Docker Image' 단계에서 params.IMAGE_REGISTRY_CREDENTIAL로 docker login 처리.
+        emptyDirVolume(mountPath: '/built-images', memory: false),   // dind(docker)와 trivy가 공유하는 emptyDir 볼륨
+        persistentVolumeClaim(claimName: 'jenkins-repo-pvc', mountPath: '/shared/maven-repo', readOnly: false), // maven build 캐시 공유
+        persistentVolumeClaim(claimName: 'jenkins-tar-pvc', mountPath: '/shared/trivy', readOnly: false) // Trivy 보안 DB , Java DB 공유
+    ],
+    imagePullSecrets: ['cicdbot-imagepull-secret']  // 현재 테스트에선 Agent가 생성되는 Namespace(Devopsit)에 생성하고 진행 
+) {
+    node('jenkinsBuildPipline') {
+        stage('Print env') {
+            script {
+                env.BUILD_DATE_TAG = sh(script: 'date +%Y%m%d%H%M', returnStdout: true).trim()
+                echo "Generated tag: ${env.BUILD_DATE_TAG}"
+                // 공통 엔드포인트 (파일 상단 상수를 env 로 노출 → sh 블록에서 $GITLAB_HOST 등으로 사용 가능)
+                env.DOMAIN         = DOMAIN
+                env.GITLAB_HOST    = GITLAB_HOST
+                env.GITLAB_URL     = GITLAB_URL
+                env.GITLAB_API_URL = GITLAB_API_URL
+                env.HARBOR_HOST    = HARBOR_HOST
+                env.HARBOR_URL     = HARBOR_URL
+                env.HARBOR_LIBRARY = HARBOR_LIBRARY
+                env.ARGOCD_HOST    = ARGOCD_HOST
+                env.ARGOCD_URL     = ARGOCD_URL
+                env.SONARQUBE_URL  = SONARQUBE_URL
+                env.K8S_API_URL    = K8S_API_URL
+
+                env.GITOPS_FULL_REPO_NAME = ''
+                env.DOCKER_PATH = ''
+                //env.IMAGE_TAG = ''
+                env.PO_SCORE = ''
+                env.MANIFEST_REPO_FLAG = 'true'
+                env.SKIP_CODE_ARTIFACT = 'false' // Jar 파일 생성 여부
+
+                // Quality Gate 스킵 여부 ('true' = 결과 대기 없이 통과, 'false' = SonarQube 결과 대기 후 판정)
+                // 현재는 스킵. 전환 시 Job 파라미터 QUALITY_GATE_PASS=false 로 넘기거나 아래 기본값을 'false' 로 변경
+                // (Boolean 파라미터의 false 가 Elvis(?:)에서 기본값으로 바뀌지 않도록 null 여부로만 판단)
+                env.QUALITY_GATE_PASS = (params.QUALITY_GATE_PASS != null ? params.QUALITY_GATE_PASS : 'true').toString().trim().toLowerCase()
+
+                // CI 변수
+                // *_REPO 는 "<GITLAB_HOST>/<group>/<repo>.git" (스킴 없음) 형식. clone 시 https://<id>:<pw>@ 를 앞에 붙인다.
+                env.GITOPS_REPO   = "${env.GITLAB_HOST}/sample-cicd/sample-petmaven-boot-gitops.git"
+                env.MANIFEST_REPO = "${env.GITLAB_HOST}/sample-cicd/sample-petmaven-boot-dev.git"
+                env.OVERLAY_PATH = 'dev' //branch와 동일하게
+                env.GITOPS_NAME = 'sample-petmaven-boot-gitops'
+                env.APPLICATION = 'sample-petmaven-boot'  // 어플리케이션명 Devopsit에선 프로젝트명과 동일하게
+                env.NAMESPACE = 'sample-dev'  // K8s 배포 네임스페이스명
+                env.APPLICATION_GROUP = 'sample'  // Devopsit 서비스명과 동일하게
+                env.SOURCE_REPO     = "${env.GITLAB_HOST}/${env.APPLICATION_GROUP}/${env.APPLICATION}.git"
+                env.IMAGE_REPO      = "${env.HARBOR_HOST}/${env.APPLICATION_GROUP}/${env.APPLICATION_GROUP}-${env.OVERLAY_PATH}/${env.APPLICATION}"
+                env.IMAGE_TAG       = "${env.BUILD_DATE_TAG}-${env.NAMESPACE}-${env.GITOPS_NAME}-${env.BUILD_NUMBER}"
+                env.IMAGE_FULL_NAME = "${env.IMAGE_REPO}:${env.IMAGE_TAG}"
+                // CD 변수
+                env.ARGO_APP = "${env.NAMESPACE}-${env.APPLICATION}"
+            }
+
+            echo "GitLab    : ${env.GITLAB_URL}"
+            echo "Harbor    : ${env.HARBOR_URL}"
+            echo "Argo CD   : ${env.ARGOCD_URL}"
+            echo "SonarQube : ${env.SONARQUBE_URL}"
+            echo "K8s API   : ${env.K8S_API_URL}"
+            echo "Source repo : ${env.SOURCE_REPO}"
+            echo "Branch: ${env.BRANCH}"
+            echo "Namespace: ${env.NAMESPACE}"
+            echo "Application : ${env.APPLICATION}"
+            echo "App Branch : ${params.GIT_BRANCH}" // Devopsit Default 파라미터명 그대로 
+            echo "Gitops repo : ${env.GITOPS_REPO}"
+            echo "Manifest repo :${env.MANIFEST_REPO}"
+            echo "overlay Path : ${env.OVERLAY_PATH}"
+            echo "gitops repo name : ${env.GITOPS_NAME}"
+            echo "QUALITY_GATE_PASS = ${env.QUALITY_GATE_PASS}"
+            echo "GIT_CREDENTIAL : ${params.GIT_CREDENTIAL}" // Devopsit Default 파라미터명 그대로 
+            echo "IMAGE_REGISTRY_CREDENTIAL : ${params.IMAGE_REGISTRY_CREDENTIAL}" // Devopsit Default 파라미터명 그대로 
+            echo "SONARQUBE_CREDENTIAL : ${params.SONARQUBE_CREDENTIAL}" // Devopsit Default 파라미터명 그대로 
+        }
+
+
+        stage('Checkout source') {
+            withCredentials([usernamePassword(credentialsId: params.GIT_CREDENTIAL, usernameVariable: 'CICDBOT_ID', passwordVariable: 'CICDBOT_PW')]) {
+                script {
+                    echo "Cloning repo: ${env.APPLICATION_GROUP}/${env.APPLICATION}, branch: ${params.GIT_BRANCH}"
+                    // source code repo clone
+                    sh """
+                        git clone --branch ${params.GIT_BRANCH} --single-branch https://${CICDBOT_ID}:${CICDBOT_PW}@${env.SOURCE_REPO} repo
+                        """
+                        // manifest.yaml repo clone
+                        def status = sh(
+                            script: """
+                                git clone --branch main --single-branch https://${CICDBOT_ID}:${CICDBOT_PW}@${env.GITOPS_REPO}
+                            """,
+                            returnStatus: true
+                        )
+                        if (status != 0) {
+                            echo " Git clone fail...."
+                            env.MANIFEST_REPO_FLAG = 'false'
+                        } else {
+                            echo "MANIFEST_REPO Git clone success"
+                        }
+
+                    /*    sh """
+                        git clone --branch main --single-branch https://${CICDBOT_ID}:${CICDBOT_PW}@gitea.example.com/devops/cicd-template.git || true  
+                        git clone --branch main --single-branch https://${CICDBOT_ID}:${CICDBOT_PW}@${env.MANIFEST_REPO} || true
+                        ls
+                        pwd
+                        cd repo
+                        git log -1 --pretty=format:%s
+                    """ */
+                }
+            }
+        }
+
+        stage('Build first') {
+            container('maven') {
+                sh '''
+                    export JAVA_HOME=/opt/java/openjdk
+                    echo "JAVA_HOME=$JAVA_HOME"
+                    ls -l "$JAVA_HOME/bin/java"
+                    mvn -version
+
+                    cd /var/jenkins_home/workspace/${JOB_NAME}/repo
+                    mvn clean compile -Dmaven.repo.local=/shared/maven-repo
+                    
+                    pwd
+                    ls -ltr
+
+                    ls -R /shared/maven-repo
+                '''
+            }
+        }
+
+        stage('SonarQube scan') {
+            container('sonarqube') {
+                withSonarQubeEnv(credentialsId: params.SONARQUBE_CREDENTIAL, installationName: 'sonarqube') { // 해당 Token은 Devopsit이 API를 통해 Jenkins에 자동으로 생성
+                    sh '''
+                        # 컨테이너 원래 환경(JAVA_HOME, PATH)으로 복원
+                        for v in JAVA_HOME PATH; do
+                            val=$(tr '\\0' '\\n' < /proc/1/environ | sed -n "s/^$v=//p")
+                            if [ -n "$val" ]; then export "$v=$val"; fi
+                        done
+                        echo "JAVA_HOME=$JAVA_HOME"
+                        echo "PATH=$PATH"
+                        command -v java && java -version
+
+                        sonar-scanner -X \
+                            -Dsonar.host.url="$SONARQUBE_URL" \
+                            -Dsonar.projectKey="$APPLICATION" \
+                            -Dsonar.sources=repo \
+                            -Dsonar.language=java \
+                            -Dsonar.java.source=17 \
+                            "-Dsonar.inclusions=repo/src/main/java/**" \
+                            -Dsonar.java.binaries=repo/target/classes
+                    '''
+                }
+            }
+        }
+
+        stage("Quality gate") {
+            timeout(time: 2, unit: 'MINUTES') {
+                script {
+                    if (env.QUALITY_GATE_PASS != 'true') {
+                        echo "[INFO] QUALITY_GATE_PASS is false. Waiting for real quality gate result..."
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                        }
+                    } else {
+                        echo "[INFO] QUALITY_GATE_PASS is true. Skipping waitForQualityGate() and assuming success."
+                    }
+                }
+            }
+        }
+
+        /*stage('Gitops repo create') {
+            container('argocli') {
+                withCredentials([string(credentialsId: params.GITLAB_TOKEN_CREDENTIAL, variable: 'GITLAB_TOKEN')]) { // 해당 Token은 Devopsit이 API를 통해 Jenkins에 자동으로 생성
+                    withEnv([
+                        "GITLAB_HOST=${env.GITLAB_HOST}",
+                        "GITLAB_API=${env.GITLAB_API_URL}",
+                        "GROUP_NAME=${env.APPLICATION_GROUP}-cicd",
+                        "REPO_NAME=${env.GITOPS_NAME}"
+                    ]) {
+                        script {
+                            // 토큰/권한 사전 확인 (실패하면 여기서 바로 원인이 보임)
+                            sh '''
+                                curl -sSf -H "Authorization: Bearer $GITLAB_TOKEN" "$GITLAB_API/user" \
+                                    | jq '{username, is_admin, can_create_group}'
+                            '''
+
+                            // 그룹 존재 확인
+                            def groupId = sh(returnStdout: true, script: '''
+                                resp=$(curl -sSf -H "Authorization: Bearer $GITLAB_TOKEN" "$GITLAB_API/groups?search=$GROUP_NAME")
+                                echo "$resp" | jq -r --arg p "$GROUP_NAME" '.[] | select(.path==$p) | .id'
+                            ''').trim()
+
+                            if (groupId == "") {
+                                echo "그룹 생성 중..."
+                                groupId = sh(returnStdout: true, script: '''
+                                    resp=$(curl -sSf -X POST -H "Authorization: Bearer $GITLAB_TOKEN" \
+                                        --data-urlencode "name=$GROUP_NAME" \
+                                        --data-urlencode "path=$GROUP_NAME" \
+                                        --data-urlencode "visibility=private" \
+                                        --data-urlencode "description=Organization for CICD pipelines" \
+                                        "$GITLAB_API/groups")
+                                    echo "$resp" | jq -r .id
+                                ''').trim()
+                            } else {
+                                echo "그룹 이미 존재함 (id=${groupId})"
+                            }
+                            if (groupId == "" || groupId == "null") { error "그룹 ID 확인 실패" }
+
+                            // 리포지토리 존재 확인 (404는 정상 흐름이라 -f 없이 코드만 확인)
+                            def repoCheck = sh(returnStdout: true, script: '''
+                                curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GITLAB_TOKEN" \
+                                    "$GITLAB_API/projects/$GROUP_NAME%2F$REPO_NAME"
+                            ''').trim()
+
+                            if (repoCheck != "200") {
+                                echo "리포지토리 ${env.GITOPS_NAME} 생성 중... (check=${repoCheck})"
+                                withEnv(["GROUP_ID=${groupId}"]) {
+                                    sh '''
+                                        curl -sSf -X POST -H "Authorization: Bearer $GITLAB_TOKEN" \
+                                            --data-urlencode "name=$REPO_NAME" \
+                                            --data "namespace_id=$GROUP_ID" \
+                                            --data-urlencode "visibility=private" \
+                                            --data-urlencode "description=repo desc" \
+                                            "$GITLAB_API/projects" > /dev/null
+
+                                        rm -rf temp-repo && mkdir -p temp-repo && cd temp-repo
+                                        git init -b main
+                                        echo "# Initial commit for $REPO_NAME" > README.md
+                                        git add README.md
+                                        git config user.name "cicdbot"
+                                        git config user.email "cicdbot@example.com"
+                                        git commit -m "Initial commit"
+                                        git push "https://oauth2:${GITLAB_TOKEN}@${GITLAB_HOST}/${GROUP_NAME}/${REPO_NAME}.git" main
+                                        cd .. && rm -rf temp-repo
+                                    '''
+                                }
+                            } else {
+                                echo "리포지토리 ${env.GITOPS_NAME} 이미 존재함"
+                            }
+                        }
+                    }
+                }
+            }
+        } */
+
+        stage('Code Artifact') {
+            if (env.SKIP_CODE_ARTIFACT?.toString() != 'true') {
+                container('maven') {
+                    def profileOpt = params.BUILD_PROFILE ? "-P${params.BUILD_PROFILE}" : ''
+                    sh """
+                        export JAVA_HOME=/opt/java/openjdk
+                        cd repo
+                        mvn package -B ${profileOpt} \\
+                            -Dmaven.test.skip=true -DskipTests=true -DtestFailureIgnore=true \\
+                            -Dmaven.repo.local=/shared/maven-repo
+                        ls -la target/*.jar
+                    """
+                }
+            }
+        }
+
+        stage('Manifest values write') {
+            container('kustomize') {
+                withCredentials([usernamePassword(credentialsId: params.GIT_CREDENTIAL, usernameVariable: 'CICDBOT_ID', passwordVariable: 'CICDBOT_PW')]) {
+                    script {
+                        def overlayPath = "${env.GITOPS_NAME}/overlays/${env.OVERLAY_PATH}"
+                        def basePath    = "${env.GITOPS_NAME}/base"
+
+                        // kustomization.yaml 의 images 항목 갱신 build 시간 Tag 추가
+                        def setImage = '''
+                            KFILE="$GITOPS_NAME/overlays/$OVERLAY_PATH/kustomization.yaml"
+                            [ -f "$KFILE" ] || { echo "kustomization.yaml 없음: $KFILE"; exit 1; }
+
+                            sed -i -E "/^[[:space:]]*- name:[[:space:]]*$APPLICATION[[:space:]]*\\$/,/newTag:/{
+                                s|^([[:space:]]*newName:).*|\\1 $IMAGE_REPO|
+                                s|^([[:space:]]*newTag:).*|\\1 $IMAGE_TAG|
+                            }" "$KFILE"
+
+                            echo "--- images (kustomization.yaml) ---"
+                            grep -n -B1 -A3 'images:' "$KFILE"
+                        '''
+
+                        if (env.MANIFEST_REPO_FLAG == 'true') {
+                            sh setImage
+                            sh """
+                                echo "Repo exists. Running kustomize build..."
+                                cd ${env.GITOPS_NAME}
+                                kustomize build overlays/${env.OVERLAY_PATH} > ${env.APPLICATION}_kubernetes.yaml
+                                cp ./${env.APPLICATION}_kubernetes.yaml ../kubernetes.yaml
+                            """
+                        }  else {
+                            sh """
+                                if [ ! -s ./${env.APPLICATION}_kubernetes.yaml ]; then
+                                    echo "Error: YAML is empty!"
+                                    exit 1
+                                fi
+                            """
+                        }
+
+                        sh """
+                            echo "--- Final Manifest ---"
+                            cat ./kubernetes.yaml
+                            echo "--- image check ---"
+                            grep -n 'image:' ./kubernetes.yaml
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Write Dockerfile') {   // 기존 'Prepare docker config' 대체
+            script {
+                if (env.DOCKER_PATH && env.DOCKER_PATH.trim() != '') {
+                    // 코드 저장소에 Dockerfile이 있는 경우: Build 스테이지가 읽는 ./Dockerfile 로 복사
+                    sh "cp ${env.DOCKER_PATH}/Dockerfile ./Dockerfile"
+                } else {
+                    if (!env.HARBOR_HOST) {
+                        error 'HARBOR_HOST 가 설정되지 않았습니다 (초기 환경 설정 스테이지 확인)'
+                    }
+
+                    def javaVersion   = params.JAVA_VERSION   ?: '17'
+                    def activeProfile = params.ACTIVE_PROFILE ?: 'dev'
+                    // def otelUrl    = params.OTEL_AGENT_URL ?: '' // OTEL 비활성
+
+                    // 빌드 산출물 jar 탐지 (-plain/-sources/-javadoc/-tests 제외)
+                    def jars = sh(returnStdout: true, script: '''
+                        cd repo/target
+                        ls -1 *.jar 2>/dev/null | grep -vE -- '-(plain|sources|javadoc|tests)\\.jar$' || true
+                    ''').trim().readLines()
+
+                    if (jars.size() == 0) { error 'repo/target 에서 실행 jar를 찾지 못했습니다' }
+                    if (jars.size() > 1)  { error "실행 jar가 여러 개입니다: ${jars}" }
+
+                    def sourceName = jars[0]        // 예: sample-petmaven-boot-3.1.0-SNAPSHOT.jar
+                    def targetName = sourceName     // 이미지 안에서도 같은 이름 사용
+
+                    // OTEL 비활성. 켜려면 아래 주석을 바꾸고 otelUrl 줄도 해제
+                    def otelLine = ''
+                    // def otelLine = otelUrl ? "ADD ${otelUrl} \${APP_HOME}/opentelemetry-javaagent.jar" : ''
+
+                    def template = '''\
+                        FROM @HARBOR_LIBRARY@/eclipse-temurin:@JAVA_VERSION@-jre
+                        LABEL APP_IMAGE=@APP_IMAGE@
+                        ENV APP_HOME=/app \\
+                            LANGUAGE= \\
+                            LANG=C.UTF-8 \\
+                            LC_ALL=C.UTF-8 \\
+                            TZ=Asia/Seoul \\
+                            JAVA_OPTS="-Dspring.profiles.active=@ACTIVE_PROFILE@" \\
+                            JAVA_OPTS_APPEND="-Dfile.encoding=UTF-8"
+                        COPY target/@SOURCE_NAME@ ${APP_HOME}/@TARGET_NAME@
+                        @OTEL_LINE@
+                        RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo ${TZ} > /etc/timezone && \\
+                            groupadd -r -g 1001 app && \\
+                            useradd -u 1001 -r -g app app && \\
+                            chown -R app:app ${APP_HOME}
+                        USER app
+                        WORKDIR ${APP_HOME}
+                        ENTRYPOINT ["sh", "-c", "java ${JAVA_OPTS} ${JAVA_OPTS_APPEND} -jar ${APP_HOME}/@TARGET_NAME@"]
+                    '''
+
+                    writeFile file: 'Dockerfile', text: template
+                        .replaceAll('(?m)^[ \\t]+', '')       // 코드 들여쓰기 제거
+                        .replace('@HARBOR_LIBRARY@', env.HARBOR_LIBRARY)
+                        .replace('@JAVA_VERSION@',   javaVersion)
+                        .replace('@APP_IMAGE@',      env.IMAGE_REPO)
+                        .replace('@ACTIVE_PROFILE@', activeProfile)
+                        .replace('@SOURCE_NAME@',    sourceName)
+                        .replace('@TARGET_NAME@',    targetName)
+                        .replace('@OTEL_LINE@',      otelLine)
+
+                    sh 'cp Dockerfile repo/Dockerfile'   // 기존 Prepare와 동일하게 repo 쪽에도 사본 유지
+                }
+                sh 'echo "--- Dockerfile ---"; cat Dockerfile'
+            }
+        }
+
+        stage('Build & Push Docker Image') {
+            // kaniko executor 대신 DinD 사이드카(dind)에 접속하는 docker 클라이언트 컨테이너에서 build/push/save 수행
+            container('docker') {
+                withCredentials([usernamePassword(credentialsId: params.IMAGE_REGISTRY_CREDENTIAL, usernameVariable: 'REGISTRY_ID', passwordVariable: 'REGISTRY_PW')]) {
+                    script {
+
+                        sh """
+                            echo "Waiting for docker daemon (dind sidecar) to be ready..."
+                            for i in \$(seq 1 30); do
+                                docker info >/dev/null 2>&1 && break
+                                echo "docker not ready yet... (\${i}/30)"
+                                sleep 2
+                            done
+                            docker info
+
+                            echo "\${REGISTRY_PW}" | docker login ${env.HARBOR_HOST} -u "\${REGISTRY_ID}" --password-stdin
+
+                            mkdir -p /built-images
+
+                            docker build \
+                                -f Dockerfile \
+                                -t ${env.IMAGE_FULL_NAME} \
+                                ./repo
+
+                            docker push ${env.IMAGE_FULL_NAME}
+
+                            docker save ${env.IMAGE_FULL_NAME} -o /built-images/${env.APPLICATION}.tar
+                        """
+
+                        sh """
+                            echo "artifactRepository=${env.IMAGE_FULL_NAME}" > ./ARTIFACT.txt
+                        """
+                    }
+                }
+            }
+        }
+
+
+        stage('Trivy image scan') {
+            container('trivy') {
+                script {
+                    env.REPORT_JSON = "../trivy-report/trivy-result.json"   // 기존과 동일 (repo 기준 상대 경로)
+                }
+                sh '''
+                    CACHE="$PWD/.cache/trivy"
+                    mkdir -p "$CACHE/db" "$CACHE/java-db" trivy-report
+
+                    tar -xvf /shared/trivy/db.tar.gz      -C "$CACHE/db"
+                    tar -xvf /shared/trivy/java-db.tar.gz -C "$CACHE/java-db"
+
+                    TAR="/built-images/$APPLICATION.tar"
+                    echo "IMAGE=$IMAGE_FULL_NAME"
+                    ls -la "$TAR"
+
+                    COMMON="--cache-dir $CACHE --skip-db-update --skip-java-db-update --offline-scan --severity CRITICAL,HIGH --exit-code 0 --input $TAR"
+
+                    trivy image $COMMON -f table
+                    trivy image $COMMON -f json -o trivy-report/trivy-result.json
+                '''
+            }
+        }
+
+
+        stage('Polaris scan and validate') {
+            container('polaris') {
+                script {
+                    sh """
+                        ls
+                        pwd
+                        polaris audit --audit-path kubernetes.yaml --format pretty | sed -r 's/\\x1B\\[[0-9;]*[mK]//g' > polaris-report.txt
+                        cat polaris-report.txt
+                    """
+                    def score = sh(
+                        script: "grep 'Final score:' polaris-report.txt | awk '{print \$3}'",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Polaris Final Score: ${score}"
+
+                    def scoreInt = score.toInteger()
+                    if (scoreInt > 50) {
+                        echo " Polaris Score ${scoreInt} is GOOD!"
+                    } else {
+                        echo " Polaris Score ${scoreInt} is TOO LOW!"
+                        error("Polaris score failed quality gate.")
+                    }
+                }
+                archiveArtifacts artifacts: 'polaris-report.txt', allowEmptyArchive: true
+            }
+        }
+
+
+        stage('Push to GitOps Repo') {
+            container('argocli') {
+                withCredentials([usernamePassword(credentialsId: params.GIT_CREDENTIAL, usernameVariable: 'CICDBOT_ID', passwordVariable: 'CICDBOT_PW')]) {
+                    script {
+                        
+                        def GIT_TAG_NAME = "${env.APPLICATION}_${env.IMAGE_TAG}"
+                        sh """
+                            echo ${env.MANIFEST_REPO}
+                            git clone --branch main --single-branch https://${CICDBOT_ID}:${CICDBOT_PW}@${env.MANIFEST_REPO} gitOps-repo
+
+                            cp ./Dockerfile gitOps-repo/
+                            cp ./ARTIFACT.txt gitOps-repo/
+                            cp ./kubernetes.yaml gitOps-repo/kubernetes.yaml
+
+                            cd gitOps-repo
+                            git config user.name "cicdbot"
+                            git config user.email "cicdbot@${env.DOMAIN}"
+
+                            if [ -f README.md ]; then
+                                echo "${GIT_TAG_NAME}" > README.md
+                            else
+                                echo "make README.md"
+                                echo "${GIT_TAG_NAME}" > README.md
+                            fi
+                            git add Dockerfile ARTIFACT.txt kubernetes.yaml README.md
+                            git commit -m "[CI/CD] Update manifest for ${GIT_TAG_NAME}" || echo "No changes to commit."
+                            git tag ${GIT_TAG_NAME}
+                            git push origin main
+                            git push origin ${GIT_TAG_NAME}
+                        """
+
+                        if(env.MANIFEST_REPO_FLAG == 'false') {
+                            sh """
+                                cd ${env.GITOPS_NAME}
+                                git config user.name "cicdbot"
+                                git config user.email "cicdbot@${env.DOMAIN}"
+                                git add Dockerfile ARTIFACT.txt kubernetes.yaml
+
+                                git commit -m "[CI/CD] Update manifest for ${env.APPLICATION}:${env.BUILD_DATE_TAG}-${env.NAMESPACE}-${env.GITOPS_NAME}-${env.BUILD_NUMBER}" || echo "No changes to commit."
+                                git push origin main
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        
+        stage('ArgoCD bootstrap') {
+            container('argocli') {
+                withCredentials([usernamePassword(credentialsId: params.GIT_CREDENTIAL, usernameVariable: 'CICDBOT_ID', passwordVariable: 'CICDBOT_PW')]) {
+                    script {
+                        def REPO_URL    = "https://${env.MANIFEST_REPO}"
+                        def ARGO_OPTS   = "--server ${env.ARGOCD_HOST} --insecure --grpc-web --auth-token ${params.ARGOCD_AUTH_TOKEN}"
+                        def APP_PATH = "."
+
+                        sh """
+                            set +x
+                            set -e
+
+                            echo "== 1) GitLab CA를 argocd-repo-server에 등록 =="
+                            argocd cert add-tls ${env.GITLAB_HOST} --from /vault-ca/ca.crt --upsert ${ARGO_OPTS}
+
+                            echo "== 2) Scoped Repository 등록 (프로젝트 한정 repo) =="
+                            for i in 1 2 3 4 5 6 7 8 9 10; do
+                                if argocd repo add ${REPO_URL} \\
+                                    --username "\${CICDBOT_ID}" --password "\${CICDBOT_PW}" \\
+                                    --project ${env.APPLICATION_GROUP} --upsert ${ARGO_OPTS}; then
+                                    break
+                                fi
+                                [ \$i -eq 10 ] && { echo "repo add 실패 (재시도 초과)"; exit 1; }
+                                echo "인증서 반영 대기 후 재시도 (\$i/10)"
+                                sleep 15
+                            done
+
+                            echo "== 3) Source Repository 등록 (프로젝트 sourceRepos) =="
+                            if argocd proj get ${env.APPLICATION_GROUP} -o json ${ARGO_OPTS} \\
+                                | jq -e --arg r "${REPO_URL}" '(.spec.sourceRepos // []) | index(\$r)' >/dev/null; then
+                                echo "이미 등록됨"
+                            else
+                                argocd proj add-source ${env.APPLICATION_GROUP} ${REPO_URL} ${ARGO_OPTS}
+                            fi
+
+                            echo "== 3-1) Cluster resource allow list: Namespace =="
+                            if argocd proj get ${env.APPLICATION_GROUP} -o json ${ARGO_OPTS} \\
+                                | jq -e '(.spec.clusterResourceWhitelist // []) | map(select(.group=="" and .kind=="Namespace")) | length > 0' >/dev/null; then
+                                echo "이미 등록됨"
+                            else
+                                argocd proj allow-cluster-resource ${env.APPLICATION_GROUP} "" Namespace ${ARGO_OPTS}
+                            fi
+
+                            echo "== 4) 애플리케이션 생성/갱신 =="
+                            argocd app create ${env.ARGO_APP} \\
+                                --project ${env.APPLICATION_GROUP} \\
+                                --repo ${REPO_URL} \\
+                                --revision main \\
+                                --path ${APP_PATH} \\
+                                --dest-server ${env.K8S_API_URL} \\
+                                --dest-namespace ${env.NAMESPACE} \\
+                                --sync-option CreateNamespace=true \\
+                                --upsert ${ARGO_OPTS}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy with ArgoCD') {
+            container('argocli') {
+                script {
+                    def ARGO_OPTS = "--server ${env.ARGOCD_HOST} --insecure --grpc-web --auth-token ${params.ARGOCD_AUTH_TOKEN}"
+
+                    sh """
+                        set +x
+                        argocd app get  ${env.ARGO_APP} --hard-refresh ${ARGO_OPTS} > /dev/null
+                        argocd app sync ${env.ARGO_APP} --timeout 300 ${ARGO_OPTS}
+                        argocd app wait ${env.ARGO_APP} --health --timeout 300 ${ARGO_OPTS}
+                        argocd app get  ${env.ARGO_APP} ${ARGO_OPTS}
+                    """
+                }
+            }
+        }
+
+        // 배포 성공 시 gitOps repo에 태그 추가 (${NAMESPACE}_${DATE}-${APPLICATION}-${BUILD_NUMBER}#${JENKINS_JOB_)NAME}-${BUILD_NMBER})
+        /*stage('Git tag push') {
+            container('argocli') {
+                script {
+                    sh """
+                        cd gitOps-repo
+
+                        TAG_PREFIX=\$(cat README.md | head -n 1 | tr -d '[:space:]')
+                        echo \$TAG_PREFIX
+
+                        TAG_NAME="\${TAG_PREFIX}-${env.BUILD_NUMBER}"
+                        echo \$TAG_NAME
+
+                        TAG_MESSAGE="\${TAG_PREFIX}#${env.JOB_BASE_NAME}-${env.BUILD_NUMBER}"
+                        echo \$TAG_MESSAGE
+
+                        git tag "\$TAG_MESSAGE"
+                        git push origin "\$TAG_MESSAGE"
+                    """
+                }
+            }
+        }*/       
+    }
+}
